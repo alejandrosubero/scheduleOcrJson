@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Horario a JSON</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+  :root { --bg:#eef1f4; --panel:#fff; --ink:#1d2733; --muted:#5b6876; --line:#c9d1d9;
+          --accent:#0f6b6b; --warn:#9a5700; --bad:#a3262a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161b21; --panel:#1f262e; --ink:#e6ebf0; --muted:#98a4b1; --line:#34404c;
+            --accent:#4fc1bd; --warn:#e0a24a; --bad:#f0787b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); line-height:1.5;
+         font:16px/1.5 "Atkinson Hyperlegible", system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:28px 18px 80px; }
+  h1 { font-size:1.7rem; margin:0 0 4px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); margin:0 0 22px; }
+  .status { display:flex; gap:12px; align-items:center; padding:12px 14px; background:var(--panel);
+            border:1px solid var(--line); border-radius:6px; margin-bottom:16px; }
+  progress { flex:0 0 120px; height:8px; accent-color:var(--accent); }
+  #drop { display:block; border:2px dashed var(--line); border-radius:6px; padding:34px 18px;
+          text-align:center; cursor:pointer; background:var(--panel); }
+  #drop:focus-within, #drop.over { border-color:var(--accent); }
+  #drop.off { opacity:.55; pointer-events:none; }
+  #drop input { position:absolute; opacity:0; width:1px; height:1px; }
+  #drop strong { display:block; font-size:1.15rem; }
+  .file { background:var(--panel); border:1px solid var(--line); border-left:5px solid var(--accent);
+          border-radius:6px; margin-top:18px; padding:16px; }
+  .file.err { border-left-color:var(--bad); }
+  .file h2 { font-size:1.05rem; margin:0; word-break:break-all; }
+  .meta { color:var(--muted); font-size:.92rem; margin:2px 0 10px; }
+  .warn { color:var(--warn); margin:8px 0; padding-left:20px; font-size:.95rem; }
+  textarea { width:100%; min-height:240px; font:13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+             background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:10px; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  button { font:inherit; padding:9px 16px; border-radius:4px; border:1px solid var(--accent);
+           background:var(--accent); color:#fff; cursor:pointer; }
+  button.alt { background:transparent; color:var(--accent); }
+  @media (prefers-color-scheme: dark) { button { color:#0b1a1a; } button.alt { color:var(--accent); } }
+  button:focus-visible, summary:focus-visible { outline:3px solid var(--warn); outline-offset:2px; }
+  details { margin-top:12px; } summary { cursor:pointer; color:var(--accent); }
+  .thumbs figure { margin:10px 0 0; } .thumbs img { max-width:100%; border:1px solid var(--line); background:#fff; }
+  .thumbs figcaption { font-size:.85rem; color:var(--muted); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Horario a JSON</h1>
+  <p class="sub">Sube capturas de “Your Schedule”. Todo se procesa en este dispositivo; las imágenes no se envían a ningún servidor.</p>
+
+  <div class="status" role="status" aria-live="polite">
+    <span id="msg">Cargando Python y el motor de OCR (la primera vez tarda).</span>
+    <progress id="bar" max="1" value="0" hidden></progress>
+  </div>
+
+  <label id="drop" class="off">
+    <input type="file" id="files" accept="image/*" multiple>
+    <strong>Elegir capturas</strong>
+    <span class="sub">o arrástralas aquí. Puedes subir varias a la vez.</span>
+  </label>
+
+  <div id="results"></div>
+  <div class="btns" style="margin-top:18px">
+    <button id="zipBtn" class="alt" hidden>Descargar todo en ZIP</button>
+    <button id="clearBtn" class="alt" hidden>Limpiar y empezar de nuevo</button>
+  </div>
+</main>
+
+<script>
+const WORKER_SRC = "const CORE_SRC = \"\\\"\\\"\\\"schedule_core.py - Logica pura (sin OCR) compartida por el CLI y la web (Pyodide).\\n\\nEtapas:  crop_cells(imagen) -> recortes  ->  [OCR externo]  ->  build_result(textos)\\nEl orden de los textos es: encabezado, y por cada fila: hora, cita, comentarios.\\n\\\"\\\"\\\"\\nimport io\\nimport json\\nimport re\\n\\nimport numpy as np\\nfrom PIL import Image, ImageOps\\n\\nSCALE = 3                  # ampliacion de cada celda antes del OCR\\nTHRESHOLDS = (70, 100, 130)  # umbrales de \\\"negro\\\" que se prueban en orden\\n\\nTIME_RE = re.compile(r\\\"(\\\\d{1,2}:\\\\d{2})\\\\s*([AP]M)\\\\s*-\\\\s*(\\\\d{1,2}:\\\\d{2})\\\\s*([AP]M)\\\", re.I)\\nCITY_RE = re.compile(r\\\"^(.+?),\\\\s*([A-Z]{2})\\\\s*,?\\\\s*(\\\\d{5})\\\\b\\\")\\n\\n\\n# ------------------------------------------------------------ deteccion de tabla\\ndef group_runs(idx, gap=2):\\n    \\\"\\\"\\\"Agrupa indices consecutivos y devuelve el centro de cada grupo.\\\"\\\"\\\"\\n    if len(idx) == 0:\\n        return []\\n    groups, start, prev = [], idx[0], idx[0]\\n    for i in idx[1:]:\\n        if i - prev > gap:\\n            groups.append((start + prev) // 2)\\n            start = i\\n        prev = i\\n    groups.append((start + prev) // 2)\\n    return groups\\n\\n\\ndef longest_runs(dark):\\n    \\\"\\\"\\\"Racha vertical mas larga de True por columna -> (largo, fila final). Vectorizado.\\\"\\\"\\\"\\n    h, w = dark.shape\\n    cur = np.zeros(w, np.int32)\\n    best = np.zeros(w, np.int32)\\n    end = np.zeros(w, np.int32)\\n    for y in range(h):\\n        cur = np.where(dark[y], cur + 1, 0)\\n        upd = cur > best\\n        best = np.where(upd, cur, best)\\n        end = np.where(upd, y, end)\\n    return best, end\\n\\n\\ndef detect_grid(dark):\\n    \\\"\\\"\\\"Devuelve (lineas_horizontales, lineas_verticales, y_final_de_la_tabla).\\\"\\\"\\\"\\n    h, w = dark.shape\\n    rows = np.where(dark.sum(axis=1) > 0.5 * w)[0]\\n    hlines = group_runs([int(r) for r in rows])\\n\\n    best, end = longest_runs(dark)\\n    min_run = max(40, int(round(0.04 * h)))  # relativo al alto de la imagen\\n    xs = [int(x) for x in np.where(best >= min_run)[0]]\\n    vlines, vends = [], []\\n    for gx in group_runs(xs):\\n        vlines.append(gx)\\n        vends.append(max([int(end[x]) for x in xs if abs(x - gx) <= 3], default=h))\\n    return hlines, vlines, (max(vends) if vends else h)\\n\\n\\ndef find_grid(img):\\n    arr = np.array(img)\\n    for t in THRESHOLDS:\\n        hl, vl, vend = detect_grid(arr < t)\\n        if len(hl) >= 2 and len(vl) >= 4:\\n            return hl, vl, vend\\n    raise RuntimeError(\\\"No se encontro la tabla. Usa la captura completa de 'Your Schedule' en modo claro.\\\")\\n\\n\\ndef prep(cell):\\n    \\\"\\\"\\\"Escala y aumenta contraste para mejorar el OCR.\\\"\\\"\\\"\\n    cell = ImageOps.autocontrast(cell.convert(\\\"L\\\"))\\n    cell = cell.resize((cell.width * SCALE, cell.height * SCALE), Image.LANCZOS)\\n    return ImageOps.expand(cell, border=20, fill=255)\\n\\n\\ndef crop_cells(source):\\n    \\\"\\\"\\\"Imagen (PIL o bytes) -> lista de celdas listas para OCR: [encabezado, (hora, cita, comentarios)*N].\\\"\\\"\\\"\\n    img = source if isinstance(source, Image.Image) else Image.open(io.BytesIO(bytes(source)))\\n    img = img.convert(\\\"L\\\")\\n    hl, vl, vend = find_grid(img)\\n    vl = vl[:5]\\n    x_time, x_app, x_com = vl[1], vl[2], vl[3]\\n    x_end = vl[4] if len(vl) > 4 else img.width - 5\\n\\n    cells = [prep(img.crop((0, 0, img.width, max(hl[0] - 5, 10))))]\\n    bands = list(zip(hl[:-1], hl[1:]))[1:]          # la primera banda es el encabezado\\n    if vend - hl[-1] > 40:                          # ultima fila cortada (sin linea inferior)\\n        bands.append((hl[-1], vend))\\n    pad = 5\\n    for y0, y1 in bands:\\n        for xa, xb in ((x_time, x_app), (x_app, x_com), (x_com, x_end)):\\n            cells.append(prep(img.crop((xa + pad, y0 + pad, xb - pad, y1 - pad))))\\n    return cells\\n\\n\\ndef extract_png(raw):\\n    \\\"\\\"\\\"Version para la web: devuelve [n_filas, [png_bytes, ...]].\\\"\\\"\\\"\\n    out = []\\n    for c in crop_cells(raw):\\n        buf = io.BytesIO()\\n        c.save(buf, format=\\\"PNG\\\")\\n        out.append(buf.getvalue())\\n    return [(len(out) - 1) // 3, out]\\n\\n\\n# ------------------------------------------------------------ parsers\\ndef lines_of(text):\\n    return [l.strip() for l in text.splitlines() if l.strip()]\\n\\n\\ndef parse_date(text):\\n    m = re.search(r\\\"(\\\\d{2})-(\\\\d{2})-(\\\\d{4})\\\", text)\\n    return f\\\"{m.group(3)}-{m.group(1)}-{m.group(2)}\\\" if m else None\\n\\n\\ndef parse_time_cell(text):\\n    t = text.replace(\\\"\\\\n\\\", \\\" \\\")\\n    m = TIME_RE.search(t)\\n    start = end = code = None\\n    rest = t\\n    if m:\\n        start, end = f\\\"{m.group(1)} {m.group(2).upper()}\\\", f\\\"{m.group(3)} {m.group(4).upper()}\\\"\\n        rest = t[m.end():]\\n    m2 = re.search(r\\\"\\\\b([A-Z]{3,}[A-Z]*REG)\\\\b\\\", rest.upper())\\n    if m2:\\n        code = m2.group(1)\\n    else:\\n        words = re.findall(r\\\"[A-Z]{4,}\\\", rest.upper())\\n        code = words[-1] if words else None\\n    return start, end, code\\n\\n\\ndef format_phone(raw):\\n    digits = re.sub(r\\\"\\\\D\\\", \\\"\\\", raw)\\n    if len(digits) == 11 and digits[0] == \\\"1\\\":\\n        digits = digits[1:]\\n    if len(digits) != 10:\\n        return None\\n    return f\\\"1({digits[:3]}){digits[3:6]}-{digits[6:]}\\\"\\n\\n\\ndef parse_appointment_cell(text):\\n    phone, body = None, []\\n    for ln in lines_of(text):\\n        m = re.match(r\\\"^T[eo]l\\\\s*:?\\\\s*(.*)$\\\", ln, re.I)\\n        if m:\\n            phone = format_phone(m.group(1))\\n        else:\\n            body.append(ln)\\n\\n    city = state = zipc = city_idx = None\\n    for i, ln in enumerate(body):\\n        m = CITY_RE.match(ln)\\n        if m:\\n            city, state, zipc = m.group(1).strip(), m.group(2), m.group(3)\\n            city_idx = i\\n            break\\n\\n    if city_idx is not None:\\n        street = body[city_idx - 1] if city_idx >= 1 else None\\n        name_lines = body[: max(city_idx - 1, 0)]\\n    else:  # fila incompleta/cortada\\n        street = body[-1] if len(body) > 1 else None\\n        name_lines = body[:-1] if len(body) > 1 else body\\n    name = \\\" \\\".join(name_lines).strip() or None\\n    if street:  # el OCR confunde \\\"Pl\\\" (Place) con \\\"PI\\\"\\n        street = re.sub(r\\\"\\\\bPI\\\\b\\\", \\\"Pl\\\", street)\\n    return name, {\\\"street\\\": street, \\\"city\\\": city, \\\"state\\\": state, \\\"zip_code\\\": zipc}, phone\\n\\n\\ndef parse_comments(text):\\n    items, cur = [], None\\n    for ln in lines_of(text):\\n        if not re.search(r\\\"[A-Za-z0-9]\\\", ln):   # ruido del OCR en celdas vacias (\\\".\\\", \\\"|\\\", \\\"-\\\")\\n            continue\\n        m = re.match(r\\\"^\\\\d+\\\\s*[.)]\\\\s*(.*)$\\\", ln)\\n        if m:\\n            if cur:\\n                items.append(cur)\\n            cur = m.group(1)\\n        else:\\n            cur = f\\\"{cur} {ln}\\\" if cur else ln\\n    if cur:\\n        items.append(cur)\\n    return \\\" | \\\".join(i.strip() for i in items if i.strip()) or None\\n\\n\\ndef build_result(texts):\\n    \\\"\\\"\\\"Textos de OCR (mismo orden que crop_cells) -> {date, rows, warnings}.\\\"\\\"\\\"\\n    texts = list(texts)\\n    rows, warnings = [], []\\n    for n, i in enumerate(range(1, len(texts) - 2, 3), start=1):\\n        start, end, code = parse_time_cell(texts[i])\\n        name, addr, phone = parse_appointment_cell(texts[i + 1])\\n        comments = parse_comments(texts[i + 2])\\n        missing = [k for k, v in {\\\"hora\\\": start, \\\"codigo\\\": code, \\\"nombre\\\": name,\\n                                  \\\"direccion\\\": addr[\\\"street\\\"], \\\"ciudad\\\": addr[\\\"city\\\"]}.items() if not v]\\n        if missing:\\n            warnings.append(f\\\"Fila {n}: faltan {', '.join(missing)}\\\")\\n        if phone is None:\\n            warnings.append(f\\\"Fila {n}: sin telefono (vacio, cortado o ilegible)\\\")\\n        rows.append({\\\"row_number\\\": n, \\\"start_time\\\": start, \\\"end_time\\\": end, \\\"service_code\\\": code,\\n                     \\\"client_name\\\": name, \\\"address\\\": addr, \\\"phone\\\": phone, \\\"comments\\\": comments})\\n    return {\\\"date\\\": parse_date(texts[0]) if texts else None, \\\"rows\\\": rows, \\\"warnings\\\": warnings}\\n\\n\\ndef build_result_json(texts):\\n    return json.dumps(build_result(texts), ensure_ascii=False)\\n\";\n// Worker de Pyodide: corre schedule_core.py fuera del hilo principal (la UI no se congela).\nimportScripts('https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js');\n\nlet core;\nconst ready = (async () => {\n  const py = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/' });\n  await py.loadPackage(['numpy', 'pillow']);\n  const src = CORE_SRC;\n  py.FS.writeFile('/schedule_core.py', src);\n  py.runPython('import sys; sys.path.insert(0, \"/\")');\n  core = py.pyimport('schedule_core');\n  postMessage({ type: 'ready' });\n})().catch(e => postMessage({ type: 'fatal', error: String(e) }));\n\nonmessage = async ({ data: { id, type, bytes, texts } }) => {\n  await ready;\n  try {\n    if (type === 'extract') {\n      const proxy = core.extract_png(bytes);\n      const [n, cells] = proxy.toJs();\n      proxy.destroy();\n      const copies = cells.map(c => Uint8Array.from(c)); // copia fuera de la memoria de Wasm\n      postMessage({ id, ok: true, result: { n, cells: copies } }, copies.map(c => c.buffer));\n    } else {\n      postMessage({ id, ok: true, result: core.build_result_json(texts) });\n    }\n  } catch (e) {\n    postMessage({ id, ok: false, error: String(e.message || e) });\n  }\n};\n";
+const $ = id => document.getElementById(id);
+const msg = t => { $('msg').textContent = t; };
+const results = [];           // {name, ta} de cada archivo procesado
+let busy = false, scheduler = null;
+const urls = [];             // miniaturas creadas, para liberarlas al limpiar
+
+// ---------- Python (Pyodide en worker) ----------
+const pyWorker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })));
+const pending = new Map();
+let seq = 0, pyReadyRes;
+const pyReady = new Promise(r => (pyReadyRes = r));
+pyWorker.onmessage = ({ data }) => {
+  if (data.type === 'ready') return pyReadyRes();
+  if (data.type === 'fatal') return msg('No se pudo iniciar Python: ' + data.error);
+  const p = pending.get(data.id); pending.delete(data.id);
+  data.ok ? p.res(data.result) : p.rej(new Error(data.error));
+};
+const call = (type, payload, transfer = []) => new Promise((res, rej) => {
+  const id = ++seq; pending.set(id, { res, rej });
+  pyWorker.postMessage({ id, type, ...payload }, transfer);
+});
+
+// ---------- OCR (Tesseract.js, pool de workers) ----------
+// Todos los workers usan siempre la misma configuracion (PSM 6, sin whitelist): nada queda "pegado" entre llamadas.
+async function initOcr() {
+  scheduler = Tesseract.createScheduler();
+  const n = Math.max(1, Math.min(2, navigator.hardwareConcurrency || 2));
+  for (let i = 0; i < n; i++) {
+    const w = await Tesseract.createWorker('eng');
+    await w.setParameters({ tessedit_pageseg_mode: '6' });
+    scheduler.addWorker(w);
+  }
+}
+
+(async () => {
+  try {
+    await Promise.all([initOcr(), pyReady]);
+    msg('Listo. Elige una o varias capturas.');
+    $('drop').classList.remove('off');
+  } catch (e) { msg('Error al iniciar: ' + e.message); }
+})();
+
+// ---------- Proceso de un archivo ----------
+async function processFile(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const { n, cells } = await call('extract', { bytes }, [bytes.buffer]);
+  let done = 0;
+  $('bar').max = cells.length; $('bar').value = 0; $('bar').hidden = false;
+  const texts = await Promise.all(cells.map(async c => {
+    const r = await scheduler.addJob('recognize', new Blob([c], { type: 'image/png' }));
+    $('bar').value = ++done;
+    return r.data.text;
+  }));
+  const out = JSON.parse(await call('parse', { texts }));
+  return { out, cells, n };
+}
+
+function card(file, res, err) {
+  const el = document.createElement('section');
+  el.className = 'file' + (err ? ' err' : '');
+  const h = document.createElement('h2'); h.textContent = file.name; el.append(h);
+  const meta = document.createElement('p'); meta.className = 'meta'; el.append(meta);
+  if (err) { meta.textContent = 'No se pudo procesar: ' + err.message; return el; }
+
+  const { out, cells, n } = res;
+  meta.textContent = `Fecha ${out.date || 'no detectada'}. ${out.rows.length} filas.`;
+  if (out.warnings.length) {
+    const ul = document.createElement('ul'); ul.className = 'warn';
+    out.warnings.forEach(w => { const li = document.createElement('li'); li.textContent = w; ul.append(li); });
+    el.append(ul);
+  }
+  const ta = document.createElement('textarea');
+  ta.value = JSON.stringify(out.rows, null, 2); ta.spellcheck = false;
+  ta.setAttribute('aria-label', 'JSON de ' + file.name);
+  el.append(ta);
+  results.push({ name: file.name.replace(/\.[^.]+$/, '') + '.json', ta, orig: ta.value });
+
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const copy = document.createElement('button'); copy.textContent = 'Copiar JSON';
+  copy.onclick = async () => { try { await navigator.clipboard.writeText(ta.value); copy.textContent = 'Copiado'; }
+                                catch { ta.select(); copy.textContent = 'Selecciona y copia a mano'; } };
+  const dl = document.createElement('button'); dl.className = 'alt'; dl.textContent = 'Descargar .json';
+  dl.onclick = () => validJson(ta) && save(new Blob([ta.value], { type: 'application/json' }), results.find(r => r.ta === ta).name);
+  btns.append(copy, dl); el.append(btns);
+
+  const det = document.createElement('details'); det.className = 'thumbs';
+  det.innerHTML = '<summary>Comparar con los recortes originales</summary>';
+  det.addEventListener('toggle', () => {   // las miniaturas se crean solo al abrir
+    if (!det.open || det.querySelector('figure')) return;
+    for (let i = 0; i < n; i++) {
+      const f = document.createElement('figure'), im = document.createElement('img'), cap = document.createElement('figcaption');
+      im.src = URL.createObjectURL(new Blob([cells[1 + 3 * i + 1]], { type: 'image/png' })); urls.push(im.src);
+      im.alt = 'Recorte de la fila ' + (i + 1); cap.textContent = 'Fila ' + (i + 1);
+      f.append(im, cap); det.append(f);
+    }
+  });
+  el.append(det);
+  return el;
+}
+
+const validJson = ta => { try { JSON.parse(ta.value); return true; } catch (e) { alert('El JSON editado no es válido: ' + e.message); return false; } };
+function save(blob, name) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+async function handle(list) {
+  const files = [...list].filter(f => f.type.startsWith('image/'));
+  if (!files.length || busy) return;
+  busy = true; $('drop').classList.add('off'); $('clearBtn').disabled = true;
+  for (const [i, f] of files.entries()) {
+    msg(`Procesando ${i + 1} de ${files.length}: ${f.name}`);
+    let el;
+    try { el = card(f, await processFile(f)); } catch (e) { el = card(f, null, e); }
+    $('results').prepend(el);
+  }
+  $('bar').hidden = true;
+  msg('Listo. Revisa los avisos y corrige el JSON si hace falta.');
+  $('zipBtn').hidden = results.length < 2;
+  $('clearBtn').hidden = !$('results').children.length; $('clearBtn').disabled = false;
+  busy = false; $('drop').classList.remove('off');
+}
+
+$('files').addEventListener('change', e => { handle(e.target.files); e.target.value = ''; });
+const drop = $('drop');
+['dragover', 'dragenter'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, () => drop.classList.remove('over')));
+drop.addEventListener('drop', e => { e.preventDefault(); handle(e.dataTransfer.files); });
+
+$('clearBtn').onclick = () => {
+  if (busy) return;
+  if (results.some(r => r.ta.value !== r.orig) && !confirm('Hay JSON editado a mano que se perderá. ¿Limpiar de todos modos?')) return;
+  $('results').replaceChildren();
+  results.length = 0;
+  urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  $('zipBtn').hidden = $('clearBtn').hidden = true;
+  $('bar').hidden = true;
+  msg('Listo. Elige una o varias capturas.');
+  window.scrollTo({ top: 0 });
+};
+
+$('zipBtn').onclick = async () => {
+  if (!results.every(r => validJson(r.ta))) return;
+  const zip = new JSZip();
+  results.forEach(r => zip.file(r.name, r.ta.value));
+  save(await zip.generateAsync({ type: 'blob' }), 'horarios.zip');
+};
+</script>
+</body>
+</html>
